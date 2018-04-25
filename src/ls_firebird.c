@@ -87,6 +87,18 @@ typedef struct {
 #endif
 
 /*
+** Sets a simple custom error status with given message
+*/
+static void custom_fb_error(ISC_STATUS *pvector, const char *msg)
+{
+	*pvector++ = 1;          /* isc_arg_gds */
+	*pvector++ = 335544382L; /* isc_random */
+	*pvector++ = 2;          /* isc_arg_string */
+	*pvector++ = (ISC_STATUS)msg;
+	*pvector++ = 0;          /* isc_arg_end */
+}
+
+/*
 ** Returns a standard database error message
 */
 static int return_db_error(lua_State *L, const ISC_STATUS *pvector)
@@ -500,8 +512,41 @@ static void fill_param(XSQLVAR *var, ISC_SHORT type, ISC_SCHAR *data,
 	if(var->sqldata != NULL) {
 		free(var->sqldata);
 	}
-	var->sqldata = (ISC_SCHAR *)malloc(len);
-	memcpy(var->sqldata, data, len);
+	if(var->sqldata = (ISC_SCHAR *)malloc(len)) {
+		memcpy(var->sqldata, data, len);
+	}
+}
+
+static void write_blob(stmt_data *stmt, ISC_QUAD *blob_id, ISC_SCHAR *data,
+                       size_t len)
+{
+	isc_blob_handle blob_handle = NULL;
+	memset(blob_id, 0, sizeof(ISC_QUAD));
+
+	isc_create_blob2(
+		stmt->env->status_vector,
+		&stmt->conn->db, &stmt->conn->transaction,
+		&blob_handle, blob_id,
+		0, NULL);
+	if(CHECK_DB_ERROR(stmt->env->status_vector)) {
+		return;
+	}
+
+	while(len > 10000) {
+		isc_put_segment(stmt->env->status_vector, &blob_handle, 10000, data);
+		if(CHECK_DB_ERROR(stmt->env->status_vector)) {
+			return;
+		}
+
+		len -= 10000;
+		data += 10000;
+	}
+	isc_put_segment(stmt->env->status_vector, &blob_handle, len, data);
+	if(CHECK_DB_ERROR(stmt->env->status_vector)) {
+		return;
+	}
+
+	isc_close_blob(stmt->env->status_vector, &blob_handle);
 }
 
 static void parse_params(lua_State *L, stmt_data *stmt, int params)
@@ -510,6 +555,7 @@ static void parse_params(lua_State *L, stmt_data *stmt, int params)
 	for(i=0; i<stmt->in_sqlda->sqln; i++) {
 		XSQLVAR *var;
 		const char *str;
+		ISC_QUAD blob_id;
 		ISC_INT64 inum;
 		double fnum;
 
@@ -530,7 +576,14 @@ static void parse_params(lua_State *L, stmt_data *stmt, int params)
 			case SQL_BLOB:
 			case SQL_TEXT:
 				str = lua_tostring(L, -1);
-				fill_param(var, SQL_TEXT+1, (ISC_SCHAR *)str, strlen(str)+1);
+				if(strlen(str) > 0x7FF0) {
+					/* need to use BLOB for >32K chars */
+					write_blob(stmt, &blob_id, (ISC_SCHAR *)str, strlen(str));
+					fill_param(var, SQL_BLOB+1, (ISC_SCHAR *)&blob_id, sizeof(ISC_QUAD));
+				} else {
+					/* plain text */
+					fill_param(var, SQL_TEXT+1, (ISC_SCHAR *)str, strlen(str)+1);
+				}
 				break;
 
 			case SQL_INT64:
@@ -577,6 +630,11 @@ static void parse_params(lua_State *L, stmt_data *stmt, int params)
 				}	break;
 				}
 				break;
+			}
+
+			if(!var->sqldata) {
+				custom_fb_error(stmt->conn->env->status_vector, "Problem allocating SQL param memory");
+				return;
 			}
 		}
 
@@ -660,6 +718,10 @@ static int conn_prepare (lua_State *L)
 	/* is there a parameter table to use */
 	if(lua_istable(L, 3)) {
 		parse_params(L, &stmt, 3);
+		if ( CHECK_DB_ERROR(conn->env->status_vector) ) {
+			free_stmt(&stmt);
+			return return_db_error(L, conn->env->status_vector);
+		}
 	}
 
 	/* copy the statement into a new lua userdata object */
@@ -1100,6 +1162,9 @@ static int stmt_execute (lua_State *L)
 	/* is there a parameter table to use */
 	if(lua_istable(L, 2)) {
 		parse_params(L, stmt, 2);
+		if ( CHECK_DB_ERROR(stmt->conn->env->status_vector) ) {
+			return return_db_error(L, stmt->conn->env->status_vector);
+		}
 	}
 
 	return raw_execute(L, 1);
