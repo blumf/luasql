@@ -688,7 +688,15 @@ static int conn_prepare (lua_State *L)
 	}
 
 	/* an unsupported SQL statement (something like COMMIT) */
-	if(stmt.type > 5) {
+	switch(stmt.type) {
+	case isc_info_sql_stmt_select:
+	case isc_info_sql_stmt_insert:
+	case isc_info_sql_stmt_update:
+	case isc_info_sql_stmt_delete:
+	case isc_info_sql_stmt_ddl:
+	case isc_info_sql_stmt_exec_procedure:
+		break;
+	default:
 		free_stmt(&stmt);
 		return luasql_faildirect(L, "unsupported SQL statement");
 	}
@@ -758,8 +766,24 @@ static int raw_execute (lua_State *L, int stmt_indx)
 	cur.stmt = stmt;
 	cur.env = stmt->env;
 
-	/* if it's a SELECT statment, allocate a cursor */
-	if(stmt->type == isc_info_sql_stmt_select) {
+	/* size the result, set if needed */
+	cur.out_sqlda = malloc_xsqlda(1);
+	isc_dsql_describe(cur.env->status_vector, &cur.stmt->handle, 1, cur.out_sqlda);
+	if (cur.out_sqlda->sqld > cur.out_sqlda->sqln) {
+		ISC_SHORT n = cur.out_sqlda->sqld;
+		free_xsqlda(cur.out_sqlda);
+		cur.out_sqlda = malloc_xsqlda(n);
+		isc_dsql_describe(cur.env->status_vector, &cur.stmt->handle, 1,
+		                  cur.out_sqlda);
+		if ( CHECK_DB_ERROR(cur.env->status_vector) ) {
+			free_cur(&cur);
+			return return_db_error(L, cur.env->status_vector);
+		}
+	}
+	malloc_sqlda_vars(cur.out_sqlda);
+
+	/* does the statment return data? allocate a cursor */
+	if(cur.out_sqlda->sqld > 0) {
 		char cur_name[64];
 		snprintf(cur_name, sizeof(cur_name), "dyn_cursor_%p", (void *)stmt);
 
@@ -780,22 +804,6 @@ static int raw_execute (lua_State *L, int stmt_indx)
 		free_cur(&cur);
 		return return_db_error(L, cur.env->status_vector);
 	}
-
-	/* size the result, set if needed */
-	cur.out_sqlda = malloc_xsqlda(1);
-	isc_dsql_describe(cur.env->status_vector, &cur.stmt->handle, 1, cur.out_sqlda);
-	if (cur.out_sqlda->sqld > cur.out_sqlda->sqln) {
-		ISC_SHORT n = cur.out_sqlda->sqld;
-		free_xsqlda(cur.out_sqlda);
-		cur.out_sqlda = malloc_xsqlda(n);
-		isc_dsql_describe(cur.env->status_vector, &cur.stmt->handle, 1,
-		                  cur.out_sqlda);
-		if ( CHECK_DB_ERROR(cur.env->status_vector) ) {
-			free_cur(&cur);
-			return return_db_error(L, cur.env->status_vector);
-		}
-	}
-	malloc_sqlda_vars(cur.out_sqlda);
 
 	/* what do we return? a cursor or a count */
 	if(cur.out_sqlda->sqld > 0) { /* a cursor */
@@ -868,7 +876,7 @@ static int conn_execute (lua_State *L)
 	stmt->hidden = 1;
 
 	/* if statement doesn't return a cursor, close it */
-	if(stmt->type != isc_info_sql_stmt_select) {
+	if(luaL_checkudata (L, -1, LUASQL_CURSOR_FIREBIRD) == NULL) {
 		if((ret = stmt_shut(L, stmt)) != 0) {
 			return ret;
 		}
@@ -1226,11 +1234,17 @@ static int stmt_gc (lua_State *L)
 static int cur_fetch (lua_State *L)
 {
 	ISC_STATUS fetch_stat;
-	int i;
-	cur_data *cur = getcursor(L,1);
+	int i, res;
+	cur_data *cur = (cur_data *)luaL_checkudata (L, 1, LUASQL_CURSOR_FIREBIRD);
 	const char *opts = luaL_optstring (L, 3, "n");
 	int num = strchr(opts, 'n') != NULL;
 	int alpha = strchr(opts, 'a') != NULL;
+
+	/* check cursor status */
+	luaL_argcheck (L, cur != NULL, 1, "cursor expected");
+	if (cur->closed) {
+		return 0;
+	}
 
 	if ((fetch_stat = isc_dsql_fetch(cur->env->status_vector, &cur->stmt->handle,
 	                                 1, cur->out_sqlda)) == 0) {
@@ -1242,13 +1256,13 @@ static int cur_fetch (lua_State *L)
 			for (i = 0; i < cur->out_sqlda->sqld; i++) {
 				push_column(L, i, cur);
 
-				if( num ) {
+				if (num) {
 					lua_pushnumber(L, i+1);
 					lua_pushvalue(L, -2);
 					lua_settable(L, 2);
 				}
 
-				if( alpha ) {
+				if (alpha) {
 					lua_pushlstring(L, cur->out_sqlda->sqlvar[i].aliasname,
 					                cur->out_sqlda->sqlvar[i].aliasname_length);
 					lua_pushvalue(L, -2);
@@ -1259,15 +1273,23 @@ static int cur_fetch (lua_State *L)
 			}
 
 			/* returning given table */
-			return 1;
+			res = 1;
 		} else {
 			for (i = 0; i < cur->out_sqlda->sqld; i++) {
 				push_column(L, i, cur);
 			}
 
 			/* returning a list of values */
-			return cur->out_sqlda->sqld;
+			res = cur->out_sqlda->sqld;
 		}
+
+		/* close cursor for procedures/returnings as they (currently) only
+		   return one result, and error on subsequent fetches */
+		if (cur->stmt->type == isc_info_sql_stmt_exec_procedure) {
+			cur_shut(L, cur);
+		}
+
+		return res;
 	}
 
 	/* isc_dsql_fetch returns 100 if no more rows remain to be retrieved
