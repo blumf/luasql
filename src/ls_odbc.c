@@ -761,7 +761,7 @@ static int raw_readparams(lua_State *L, stmt_data *stmt, int iparams)
 			lua_pop(L, 1);
 
 			if(error(SQLBindParameter(stmt->hstmt, i, SQL_PARAM_INPUT, SQL_C_CHAR,
-			                          SQL_CHAR, len, 0, data->buf, data->len,
+			                          SQL_LONGVARCHAR, len, 0, data->buf, data->len,
 			                          &data->type))) {
 				return fail(L, hSTMT, stmt->hstmt);
 			}
