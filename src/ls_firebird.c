@@ -541,7 +541,7 @@ static void write_blob(stmt_data *stmt, ISC_QUAD *blob_id, ISC_SCHAR *data,
 		len -= 10000;
 		data += 10000;
 	}
-	isc_put_segment(stmt->env->status_vector, &blob_handle, len, data);
+	isc_put_segment(stmt->env->status_vector, &blob_handle, (unsigned short)len, data);
 	if(CHECK_DB_ERROR(stmt->env->status_vector)) {
 		return;
 	}
@@ -558,6 +558,7 @@ static void parse_params(lua_State *L, stmt_data *stmt, int params)
 		ISC_QUAD blob_id;
 		ISC_INT64 inum;
 		double fnum;
+		size_t len;
 
 		lua_pushnumber(L, i+1);
 		lua_gettable(L, params);
@@ -576,13 +577,14 @@ static void parse_params(lua_State *L, stmt_data *stmt, int params)
 			case SQL_BLOB:
 			case SQL_TEXT:
 				str = lua_tostring(L, -1);
-				if(strlen(str) > 0x7FF0) {
+				len = strlen(str);
+				if(len > 0x7FF0) {
 					/* need to use BLOB for >32K chars */
-					write_blob(stmt, &blob_id, (ISC_SCHAR *)str, strlen(str));
+					write_blob(stmt, &blob_id, (ISC_SCHAR *)str, len);
 					fill_param(var, SQL_BLOB+1, (ISC_SCHAR *)&blob_id, sizeof(ISC_QUAD));
 				} else {
 					/* plain text */
-					fill_param(var, SQL_TEXT+1, (ISC_SCHAR *)str, strlen(str)+1);
+					fill_param(var, SQL_TEXT+1, (ISC_SCHAR *)str, (ISC_SHORT)len+1);
 				}
 				break;
 
@@ -620,7 +622,13 @@ static void parse_params(lua_State *L, stmt_data *stmt, int params)
 				case LUA_TSTRING: {
 					/* date/time string passed */
 					str = lua_tostring(L, -1);
-					fill_param(var, SQL_TEXT+1, (ISC_SCHAR *)str, strlen(str)+1);
+					len = strlen(str);
+					if (len > 0x7FF0) {
+						/* impossibly long date/time string we can't handle */
+						custom_fb_error(stmt->conn->env->status_vector, "Date/time string too long");
+						return;
+					}
+					fill_param(var, SQL_TEXT+1, (ISC_SCHAR *)str, (ISC_SHORT)len+1);
 				}	break;
 
 				default: {

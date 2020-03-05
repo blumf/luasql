@@ -19,9 +19,11 @@
 #endif
 
 #if LUA_VERSION_NUM>=503
+#define luasql_Integer lua_Integer
 #define luasql_pushinteger lua_pushinteger
 #define luasql_isinteger lua_isinteger
 #else
+#define luasql_Integer lua_Number
 #define luasql_pushinteger lua_pushnumber
 #define luasql_isinteger lua_isnumber
 #endif
